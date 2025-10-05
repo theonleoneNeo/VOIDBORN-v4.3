@@ -2700,5 +2700,376 @@ if (!window.__VB_ALLIANCE_NET__) (function(){
 })();
 </script>
 <!-- ====== END: Alliance & Networking Patch ====== -->
+
+<!-- ====== BEGIN: Ultra-Pacifist Trade Suite — Indices, Swap Lines, Co-Load, Freeport Auctions, Missions, Rebates, AMM, SLAs, Provenance, Multi-Hop v2 ====== -->
+<script>
+if(!window.__VB_TRADE_SUITE__)(function(){
+  window.__VB_TRADE_SUITE__ = true;
+
+  (function wait(){
+    if (typeof window.update==='function' && Array.isArray(window.factions) && Array.isArray(window.buildings) && Array.isArray(window.majorEvents)){
+      boot();
+    } else setTimeout(wait,60);
+  })();
+
+  function boot(){
+    const _prevUpdate = window.update;
+    const _push = window.pushEvent || function(){ };
+    const clamp=(x,a,b)=>Math.max(a,Math.min(b,x));
+    const pick = arr => arr[Math.floor(Math.random()*arr.length)];
+    const $ = id => document.getElementById(id);
+
+    function ensureSubpanel(containerId, subId, title){
+      const host = $(containerId); if(!host) return null;
+      let sub = document.getElementById(subId);
+      if(!sub){
+        sub = document.createElement('div');
+        sub.id = subId;
+        sub.innerHTML = `<div class="statbox"><b>${title}</b><div id="${subId}-content" style="font-size:12px;margin-top:4px"></div></div>`;
+        host.parentElement?.insertBefore(sub, host.nextSibling);
+      }
+      return document.getElementById(subId+'-content');
+    }
+    function setHTML(id, html){
+      if (window.VBUI && VBUI.set) VBUI.set(id, html);
+      else { const el=document.getElementById(id); if(el) el.innerHTML = html; }
+    }
+    function ensureWallet(f){ if(!f.wallet) f.wallet={G:2,A:2,B:2}; }
+
+    function alliedPairs(th=58){
+      const pairs=[];
+      for(const a of window.factions){
+        for(const b of window.factions){
+          if(!a||!b||a.id>=b.id) continue;
+          const r=a.relations?.get(b.id);
+          if(r && (r.trust||0) > th) pairs.push([a,b]);
+        }
+      }
+      return pairs;
+    }
+
+    /* ========== 1) Commodity Indices + Forward Orders ========== */
+    const IDX = {
+      uiId:'vb-indices',
+      goods:['food','culture','tech','mats','artifact'],
+      value:{},
+      alpha:0.10,
+      fwd:[], // {fid,good,qty,settleIn,priceBooked}
+      lastSettle:'—'
+    };
+    // init baselines
+    IDX.goods.forEach(g=>IDX.value[g]=1.0);
+
+    function stepIndicesAndForwards(){
+      // drift indices gently
+      const econ = (typeof window.economyIndex==='number'? window.economyIndex : 1.0);
+      const routeCount = window.factions.reduce((s,f)=>s+((f.tradeRoutes&&f.tradeRoutes.length)||0),0);
+      const pressure = clamp(routeCount/30, -0.2, 0.6);
+      for(const g of IDX.goods){
+        const noise = (Math.random()-0.5)*0.06 + pressure*0.01 + (econ-1)*0.01;
+        const target = clamp(1 + noise, 0.8, 1.2);
+        IDX.value[g] = clamp(IDX.value[g]*(1-IDX.alpha) + target*IDX.alpha, 0.6, 1.6);
+      }
+
+      // occasionally place a small forward order from a random faction
+      if (Math.random()<0.05){
+        const f = pick(window.factions);
+        const g = pick(IDX.goods);
+        if(f){ IDX.fwd.push({fid:f.id, good:g, qty: 5+Math.random()*10, settleIn: 80+Math.floor(Math.random()*120), priceBooked: IDX.value[g]}); }
+      }
+
+      // settle forwards
+      for(const o of IDX.fwd){
+        if(o.done) continue;
+        o.settleIn--;
+        if(o.settleIn<=0){
+          const f = window.factions.find(x=>x.id===o.fid); if(!f) { o.done=true; continue; }
+          ensureWallet(f);
+          const priceNow = IDX.value[o.good];
+          const base = 1.0;
+          const pay = o.qty * priceNow * base;
+          // forward: if locked lower earlier, buyer gains; simulate by small G delta
+          const delta = clamp((o.priceBooked - priceNow)*o.qty*0.1, -1.5, 1.5);
+          f.wallet.G = (f.wallet.G||0) - pay*0.01 + delta; // tiny settlement impact
+          o.done = true;
+          IDX.lastSettle = `${f.name} ${o.good} ${o.qty.toFixed(0)} @ ${priceNow.toFixed(2)}`;
+          _push('trade', 'forward order settled');
+          if(typeof window.economyIndex==='number'){ window.economyIndex = clamp(window.economyIndex*0.999, 0.5, 2.5); }
+        }
+      }
+    }
+    function renderIndices(){
+      const tgt = ensureSubpanel('trade-list', IDX.uiId, 'Commodity Indices & Forwards');
+      if(!tgt) return;
+      const rows = IDX.goods.map(g=>`<div>${g}: <b>${IDX.value[g].toFixed(2)}</b></div>`).join('');
+      const q = IDX.fwd.filter(o=>!o.done).length;
+      setHTML(IDX.uiId+'-content', `${rows}<div>Open forwards: <b>${q}</b> • Last: ${IDX.lastSettle}</div>`);
+    }
+
+    /* ========== 2) Swap Lines (G↔A↔B) backed by Trust ========== */
+    const SWP = { uiId:'vb-swaps', lines: new Map(), rebate:0 };
+    function key(a,b){ return a< b ? a+'|'+b : b+'|'+a; }
+    function ensureLine(a,b){
+      const k = key(a.id,b.id);
+      if(!SWP.lines.has(k)){
+        const trust = (a.relations?.get(b.id)?.trust||50);
+        const rate = clamp(1 - (trust-50)/500, 0.95, 1.05); // 50→1.00, 100→0.90 (but clamped 0.95), 0→1.10 (clamped 1.05)
+        SWP.lines.set(k, {a:a.id,b:b.id, limit: 8 + trust*0.1, rate});
+      }
+      return SWP.lines.get(k);
+    }
+    function stepSwaps(){
+      for(const [a,b] of alliedPairs(60)){
+        const L = ensureLine(a,b);
+        [a,b].forEach(f=>ensureWallet(f));
+        // convert tiny amounts for deficits (if one currency <1 and others >4)
+        for(const f of [a,b]){
+          const w=f.wallet;
+          const low = Object.entries(w).sort((x,y)=>x[1]-y[1])[0][0];
+          const high = Object.entries(w).sort((x,y)=>y[1]-x[1])[0][0];
+          if(w[low]<1 && w[high]>4 && L.limit>0){
+            const amt = Math.min(0.4, w[high]*0.05, L.limit*0.1);
+            w[high]-=amt; w[low]+=amt*0.98; L.limit -= amt;
+          }
+        }
+      }
+    }
+    function renderSwaps(){
+      const tgt = ensureSubpanel('trade-list', SWP.uiId, 'Swap Lines (Trust-backed)');
+      if(!tgt) return;
+      const rows = [...SWP.lines.values()].slice(-8).map(L=>{
+        const A=window.factions.find(f=>f.id===L.a)?.name||L.a; const B=window.factions.find(f=>f.id===L.b)?.name||L.b;
+        return `<div>${A} ↔ ${B} — limit ${L.limit.toFixed(1)} @ rate ${L.rate.toFixed(3)}</div>`;
+      }).join('') || '—';
+      setHTML(SWP.uiId+'-content', rows);
+    }
+
+    /* ========== 3) Co-Load Schedules (Container Pools) ========== */
+    const CLD = { uiId:'vb-coload', sailings:[], cadence:140 };
+    function stepCoLoad(){
+      const gen = window.generation||0;
+      if(gen % CLD.cadence === 0){
+        const routes = window.factions.reduce((s,f)=>s+((f.tradeRoutes&&f.tradeRoutes.length)||0),0);
+        CLD.sailings.push({id:'SL'+Math.random().toString(36).slice(2,6), capacity: 20+Math.min(60, routes*2), booked: 0});
+      }
+      for(const s of CLD.sailings){
+        const demand = 5 + Math.random()*15;
+        s.booked = clamp(s.booked + demand, 0, s.capacity);
+        if(s.booked >= s.capacity && !s.done){ s.done=true; _push('trade','co-load departure'); }
+      }
+    }
+    function renderCoLoad(){
+      const tgt = ensureSubpanel('trade-list', CLD.uiId, 'Co-Load Schedules');
+      if(!tgt) return;
+      const rows = CLD.sailings.slice(-4).map(s=>{
+        const pct = Math.round(100*s.booked/s.capacity);
+        return `<div>Sailing ${s.id}: <b>${pct}%</b> full</div>`;
+      }).join('') || '—';
+      setHTML(CLD.uiId+'-content', rows);
+    }
+
+    /* ========== 4) Freeport Clearance Auctions ========== */
+    const AUC = { uiId:'vb-auctions', list:[], halflife: 120 };
+    function stepAuctions(){
+      // seed using freeports if present
+      const freeports = (window.FRP && window.FRP.ids) ? [...window.FRP.ids] : [];
+      if(freeports.length && AUC.list.length<4 && Math.random()<0.05){
+        const good = pick(IDX.goods);
+        AUC.list.push({id:'AUC'+Math.random().toString(36).slice(2,6), good, qty: 10+Math.floor(Math.random()*20), price: 1.4, tick:0});
+      }
+      for(const a of AUC.list){
+        if(a.done) continue;
+        a.tick++;
+        a.price = clamp(a.price * 0.995, 0.6, 1.4);
+        if(Math.random()<0.06){
+          const buyer = pick(window.factions); if(!buyer) continue; ensureWallet(buyer);
+          const take = Math.min(a.qty, 2+Math.floor(Math.random()*5));
+          const cost = take * a.price;
+          if((buyer.wallet.G||0) > cost){
+            buyer.wallet.G -= cost;
+            a.qty -= take;
+            if(a.qty<=0){ a.done=true; _push('trade','freeport auction cleared'); }
+          }
+        }
+      }
+    }
+    function renderAuctions(){
+      const tgt = ensureSubpanel('trade-list', AUC.uiId, 'Freeport Clearance Auctions');
+      if(!tgt) return;
+      const rows = AUC.list.slice(-5).map(a=>`<div>${a.good} — qty ${a.qty} @ <b>${a.price.toFixed(2)}</b>${a.done?' ✔':''}</div>`).join('') || '—';
+      setHTML(AUC.uiId+'-content', rows);
+    }
+
+    /* ========== 5) Trade Missions & Catalogs (MoUs & tariff holidays) ========== */
+    const MIS = { uiId:'vb-missions', missions:[], holidays:[] };
+    function stepMissions(){
+      // seed missions between embassy pairs if any
+      const embPairs = (window.EMB && window.EMB.list) ? window.EMB.list.map(e=>[e.a, e.b]) : alliedPairs(62).map(p=>[p[0].id,p[1].id]);
+      if(embPairs.length && MIS.missions.length<4 && Math.random()<0.04){
+        const [a,b] = pick(embPairs);
+        MIS.missions.push({id:'MS'+Math.random().toString(36).slice(2,6), from:a, to:b, eta: 80+Math.floor(Math.random()*120)});
+      }
+      for(const m of MIS.missions){
+        if(m.done) continue;
+        m.eta--;
+        if(m.eta<=0){
+          m.done=true;
+          MIS.holidays.push({from:m.from, to:m.to, ends:(window.generation||0)+220});
+          _push('trade','mission MoU signed (tariff holiday)');
+        }
+      }
+      // expire holidays
+      MIS.holidays = MIS.holidays.filter(h=>(window.generation||0) < h.ends);
+    }
+    function renderMissions(){
+      const tgt = ensureSubpanel('trade-list', MIS.uiId, 'Trade Missions & Catalogs');
+      if(!tgt) return;
+      const rows = [
+        MIS.missions.slice(-4).map(m=>`<div>Mission ${m.id}: ${nameOf(m.from)} → ${nameOf(m.to)} — ${m.done?'done':'ETA '+m.eta+'g'}</div>`).join(''),
+        '<div style="margin-top:4px">Tariff Holidays:</div>',
+        MIS.holidays.slice(-6).map(h=>`<div>${nameOf(h.from)} → ${nameOf(h.to)} (ends ${h.ends})</div>`).join('')
+      ].join('');
+      setHTML(MIS.uiId+'-content', rows || '—');
+    }
+    function nameOf(fid){ return window.factions.find(f=>f.id===fid)?.name||fid; }
+
+    /* ========== 6) Standards-Linked Rebates ========== */
+    const REB = { uiId:'vb-rebates', ledger:[], lastTotal:0 };
+    function stepRebates(){
+      let total=0;
+      for(const f of window.factions){
+        const routes=(f.tradeRoutes&&f.tradeRoutes.length)||0;
+        const score=(f.standardScore||0);
+        if(routes && score){
+          const amt = routes * score * 0.01; // small
+          ensureWallet(f); f.wallet.G += amt;
+          total += amt;
+        }
+      }
+      if(total>0){ REB.lastTotal = total; if(Math.random()<0.05) _push('trade','standards rebate'); }
+    }
+    function renderRebates(){
+      const tgt = ensureSubpanel('trade-list', REB.uiId, 'Standards-Linked Rebates');
+      if(!tgt) return;
+      setHTML(REB.uiId+'-content', `<div>Last tick total: <b>${REB.lastTotal.toFixed(2)}</b> G</div>`);
+    }
+
+    /* ========== 7) AMM Market Maker for G/A/B ========== */
+    const AMM = { uiId:'vb-amm', G: 80, A: 80, B: 80, fee: 0.003, fundA:0 };
+    function trade(poolFrom, poolTo, amount){
+      // x*y*k model
+      const x0 = AMM[poolFrom], y0 = AMM[poolTo];
+      if (amount<=0 || x0<=0 || y0<=0) return 0;
+      const amtIn = amount*(1-AMM.fee);
+      const k = x0*y0;
+      const x1 = x0 + amtIn;
+      const y1 = k / x1;
+      let out = y0 - y1;
+      if(!isFinite(out) || out<=0) return 0;
+      AMM[poolFrom] = x1;
+      AMM[poolTo]   = y1;
+      AMM.fundA += amount*AMM.fee; // fees to stabilization fund (A for simplicity)
+      return out;
+    }
+    function stepAMM(){
+      // gentle balancing: if any faction has G >> A/B or vice versa, swap a tiny bit via pool
+      for(const f of window.factions){
+        ensureWallet(f);
+        const w=f.wallet;
+        const maxKey = ['G','A','B'].reduce((m,k)=> w[k]>w[m]?k:m, 'G');
+        const minKey = ['G','A','B'].reduce((m,k)=> w[k]<w[m]?k:m, 'G');
+        if(w[maxKey] - w[minKey] > 6){
+          const amt = Math.min(0.8, (w[maxKey]-w[minKey])*0.05);
+          const out = trade(maxKey, minKey, amt);
+          if(out>0){ w[maxKey]-=amt; w[minKey]+=out; }
+        }
+      }
+    }
+    function renderAMM(){
+      const tgt = ensureSubpanel('trade-list', AMM.uiId, 'AMM (G/A/B)');
+      if(!tgt) return;
+      setHTML(AMM.uiId+'-content', `<div>Pool G:${AMM.G.toFixed(1)} A:${AMM.A.toFixed(1)} B:${AMM.B.toFixed(1)} • Fund(A): <b>${AMM.fundA.toFixed(2)}</b></div>`);
+    }
+
+    /* ========== 8) Service-Level Agreements (SLAs) ========== */
+    const SLA = { uiId:'vb-sla', week: 240, log:[] };
+    function stepSLA(){
+      const gen = window.generation||0;
+      if(gen % SLA.week === 0){
+        // “Measure” on-time rate by throughput context (guilds/freeports raise success)
+        const members = (window.GUILD && window.GUILD.members)? window.GUILD.members.size : 0;
+        const freeports = (window.FRP && window.FRP.ids)? window.FRP.ids.size : 0;
+        const baseOnTime = 0.6 + Math.min(0.3, members*0.02 + freeports*0.02);
+        for(const f of window.factions){
+          ensureWallet(f);
+          const success = Math.random() < baseOnTime;
+          if(success){ f.wallet.B += 0.6; SLA.log.push(`${f.name} +B SLA`); }
+          else { f.wallet.G = Math.max(0, (f.wallet.G||0) - 0.4); SLA.log.push(`${f.name} -G SLA`); }
+        }
+        if(SLA.log.length>40) SLA.log.splice(0, SLA.log.length-40);
+      }
+    }
+    function renderSLA(){
+      const tgt = ensureSubpanel('trade-list', SLA.uiId, 'Route SLAs');
+      if(!tgt) return;
+      setHTML(SLA.uiId+'-content', SLA.log.slice(-6).map(x=>`<div>${x}</div>`).join('') || '—');
+    }
+
+    /* ========== 9) Consortium Licenses & Provenance Badges ========== */
+    const PRV = { uiId:'vb-provenance', goodsBadges: {'artifact':['museumAPI'], 'food':['greenLog'], 'tech':['openStats','eduCreds']}, effect:0.02 };
+    function renderProvenance(){
+      const tgt = ensureSubpanel('trade-list', PRV.uiId, 'Provenance & Badges');
+      if(!tgt) return;
+      const rows = Object.entries(PRV.goodsBadges).map(([g,arr])=>`<div>${g}: ${arr.join(', ')}</div>`).join('');
+      setHTML(PRV.uiId+'-content', rows || '—');
+    }
+
+    /* ========== 10) Multi-Hop Optimizer v2 (Relay Brokerage) ========== */
+    const RB = { uiId:'vb-relay', executed:0, brokerFundA:0 };
+    function stepRelay(){
+      const freeports = (window.FRP && window.FRP.ids)? window.FRP.ids.size : 0;
+      const emb = (window.EMB && window.EMB.list)? window.EMB.list.length : alliedPairs(65).length;
+      const density = freeports + emb;
+      if(density>1 && Math.random()<0.05){
+        RB.executed++;
+        RB.brokerFundA += 0.1;
+        _push('trade','relay brokerage multi-hop');
+        if(typeof window.economyIndex==='number'){ window.economyIndex = clamp(window.economyIndex*0.999, 0.5, 2.5); }
+      }
+    }
+    function renderRelay(){
+      const tgt = ensureSubpanel('trade-list', RB.uiId, 'Multi-Hop Optimizer v2');
+      if(!tgt) return;
+      setHTML(RB.uiId+'-content', `<div>Relays executed: <b>${RB.executed}</b> • Broker Fund(A): <b>${RB.brokerFundA.toFixed(2)}</b></div>`);
+    }
+
+    /* ========== INTEGRATION ========== */
+    window.update = function(){
+      _prevUpdate();
+
+      stepIndicesAndForwards(); renderIndices();
+      stepSwaps();               renderSwaps();
+      stepCoLoad();              renderCoLoad();
+      stepAuctions();            renderAuctions();
+      stepMissions();            renderMissions();
+      stepRebates();             renderRebates();
+      stepAMM();                 renderAMM();
+      stepSLA();                 renderSLA();
+      renderProvenance();
+      stepRelay();               renderRelay();
+    };
+
+    // Legend chip
+    const legend = document.getElementById('legendBox');
+    if(legend){
+      const tag=document.createElement('div');
+      tag.className='item';
+      tag.innerHTML=`<span class="dot" style="background:#06b6d4"></span><span>Ultra‑Pacifist Trade Suite</span>`;
+      legend.appendChild(tag);
+    }
+  }
+})();
+</script>
+<!-- ====== END: Ultra-Pacifist Trade Suite ====== -->
 </body>
 </html>
